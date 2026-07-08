@@ -1,0 +1,39 @@
+send_alarm_keystrokes:
+  description: Sends keystrokes to the virtual keypad of an alarm control panel.
+  fields:
+    entity_id:
+      description: Name(s) of the entities to send keystrokes to.
+      example: "alarm_control_panel.partition_1"
+    keystrokes:
+      description: String of keystrokes.
+      example: "*101#"
+
+send_command:
+  description: Sends a raw Control4 command to Control4 entities or item IDs.
+  fields:
+    entity_id:
+      required: false
+      description: Control4 entity ID or list of Control4 entity IDs.
+      example: media_player.john_office
+      selector:
+        entity:
+          integration: control4
+          multiple: true
+    item_id:
+      required: false
+      description: Control4 item ID or list of item IDs. Used when no entity target is provided.
+      example: 255
+      selector:
+        object:
+    command:
+      required: true
+      description: Control4 command name to send.
+      example: SKIP_FWD
+      selector:
+        text:
+    params:
+      required: false
+      description: Command parameters dictionary.
+      example: {}
+      selector:
+        object:

@@ -1,179 +1,238 @@
 """The Control4 integration."""
 
-from dataclasses import dataclass
-import json
+from __future__ import annotations
+
+import asyncio
 import logging
+from functools import cached_property
 from typing import Any
+import random
 
 from aiohttp import client_exceptions
 from pyControl4.account import C4Account
 from pyControl4.director import C4Director
-from pyControl4.error_handling import BadCredentials
+from pyControl4.error_handling import BadCredentials, InvalidCategory
+from pyControl4.websocket import C4Websocket
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
     CONF_HOST,
     CONF_PASSWORD,
-    CONF_SCAN_INTERVAL,
     CONF_TOKEN,
     CONF_USERNAME,
     Platform,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
-from homeassistant.helpers import aiohttp_client, device_registry as dr
+from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady, ServiceValidationError
+from homeassistant.helpers import (
+    aiohttp_client,
+    config_validation as cv,
+    device_registry as dr,
+    entity_registry as er,
+)
+import voluptuous as vol
+from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.update_coordinator import (
+    CoordinatorEntity,
+    DataUpdateCoordinator,
+)
 
 from .const import (
-    API_RETRY_TIMES,
+    Control4ConfigEntry,
+    CONF_ACCOUNT,
+    CONF_ALARM_ARM_STATES,
+    CONF_ALARM_AWAY_MODE,
+    CONF_ALARM_CUSTOM_BYPASS_MODE,
+    CONF_ALARM_HOME_MODE,
+    CONF_ALARM_NIGHT_MODE,
+    CONF_ALARM_VACATION_MODE,
+    CONF_CANCEL_TOKEN_REFRESH_CALLBACK,
+    CONF_CONFIG_LISTENER,
     CONF_CONTROLLER_UNIQUE_ID,
-    DEFAULT_SCAN_INTERVAL,
+    CONF_DIRECTOR,
+    CONF_DIRECTOR_ALL_ITEMS,
+    CONF_DYNAMIC_DEVICE_CALLBACKS,
+    CONF_DYNALITE_ENABLED,
+    CONF_DIRECTOR_MODEL,
+    CONF_DIRECTOR_SW_VERSION,
+    CONF_ENTITY_PREPEND_PARENT_NAME,
+    CONF_WEBSOCKET,
+    CONF_UI_CONFIGURATION,
+    DEFAULT_ALARM_AWAY_MODE,
+    DEFAULT_ALARM_CUSTOM_BYPASS_MODE,
+    DEFAULT_ALARM_HOME_MODE,
+    DEFAULT_ALARM_NIGHT_MODE,
+    DEFAULT_ALARM_VACATION_MODE,
+    DEFAULT_ENTITY_PREPEND_PARENT_NAME,
     DOMAIN,
+    RETRY_BACKOFF_MAX_SEC,
+    SCHEDULE_REFRESH_ADVANCE_SEC,
+    SERVICE_SEND_COMMAND,
+    SERVICE_FIELD_COMMAND,
+    SERVICE_FIELD_PARAMS,
+    SERVICE_FIELD_ITEM_ID,
 )
+from .config_flow import Control4ExportView
+from .director_utils import (
+    director_get_entry_variables,
+    director_has_dynalite_triggers,
+)
+from . import dynalite as dynalite_module
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.CLIMATE, Platform.COVER, Platform.LIGHT, Platform.MEDIA_PLAYER]
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-@dataclass
-class Control4RuntimeData:
-    """Control4 runtime data."""
-
-    account: C4Account
-    controller_unique_id: str
-    director: C4Director
-    director_all_items: list[dict[str, Any]]
-    director_model: str
-    director_sw_version: str
-    scan_interval: int
-    ui_configuration: dict[str, Any] | None
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    """Register the export view when the integration is loaded (so the route exists before entries)."""
+    hass.data.setdefault(DOMAIN, {})
+    if "_export_view_registered" not in hass.data[DOMAIN]:
+        hass.http.register_view(Control4ExportView())
+        hass.data[DOMAIN]["_export_view_registered"] = True
+    return True
 
 
-type Control4ConfigEntry = ConfigEntry[Control4RuntimeData]
+PLATFORMS = [
+    Platform.LIGHT,
+    Platform.ALARM_CONTROL_PANEL,
+    Platform.BINARY_SENSOR,
+    Platform.LOCK,
+    Platform.MEDIA_PLAYER,
+    Platform.SENSOR,
+    Platform.SWITCH,
+    Platform.FAN,
+    Platform.CLIMATE,
+    Platform.COVER,
+]
 
-
-async def call_c4_api_retry(func, *func_args):
-    """Call C4 API function and retry on failure."""
-    exc = None
-    for i in range(API_RETRY_TIMES):
-        try:
-            return await func(*func_args)
-        except client_exceptions.ClientError as exception:
-            _LOGGER.debug(
-                "Attempt %d/%d failed connecting to Control4 account API: %s",
-                i + 1,
-                API_RETRY_TIMES,
-                exception,
-            )
-            exc = exception
-
-    _LOGGER.error(
-        "Failed to connect to Control4 account API after %d attempts: %s",
-        API_RETRY_TIMES,
-        exc,
-    )
-    raise ConfigEntryNotReady(
-        f"Failed to connect to Control4 account API after {API_RETRY_TIMES} attempts"
-    ) from exc
-
+SERVICE_SEND_COMMAND_SCHEMA = vol.Schema(
+    {
+        vol.Required(SERVICE_FIELD_COMMAND): vol.All(
+            cv.string, lambda value: value.strip(), vol.Length(min=1)
+        ),
+        vol.Optional(SERVICE_FIELD_PARAMS, default={}): dict,
+        vol.Optional(ATTR_ENTITY_ID): vol.All(
+            vol.Any(cv.entity_id, [cv.entity_id]),
+            lambda value: [value] if isinstance(value, str) else value,
+        ),
+        vol.Optional(SERVICE_FIELD_ITEM_ID): vol.All(
+            vol.Any(vol.Coerce(int), [vol.Coerce(int)]),
+            lambda value: [value] if isinstance(value, int) else value,
+        ),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 async def async_setup_entry(hass: HomeAssistant, entry: Control4ConfigEntry) -> bool:
     """Set up Control4 from a config entry."""
-    account_session = aiohttp_client.async_get_clientsession(hass)
-
+    hass.data.setdefault(DOMAIN, {})
+    if "_export_view_registered" not in hass.data[DOMAIN]:
+        hass.http.register_view(Control4ExportView())
+        hass.data[DOMAIN]["_export_view_registered"] = True
+    entry_data: dict[str, Any] = {}
+    entry.runtime_data = entry_data
     config = entry.data
-    account = C4Account(config[CONF_USERNAME], config[CONF_PASSWORD], account_session)
+
+    await refresh_tokens(hass, entry)
+    # Copy controller unique id from config to entry_data for use by entities
+    entry_data[CONF_CONTROLLER_UNIQUE_ID] = config[CONF_CONTROLLER_UNIQUE_ID]
+
+    # Add Control4 controller to device registry
     try:
-        await account.getAccountBearerToken()
-    except client_exceptions.ClientError as exception:
-        _LOGGER.error("Error connecting to Control4 account API: %s", exception)
-        raise ConfigEntryNotReady(
-            "Error connecting to Control4 account API to get bearer token"
-        ) from exception
-    except BadCredentials as exception:
-        _LOGGER.error(
-            (
-                "Error authenticating with Control4 account API, incorrect username or"
-                " password: %s"
-            ),
-            exception,
-        )
-        return False
+        controller_href = (await entry_data[CONF_ACCOUNT].get_account_controllers())[
+            "href"
+        ]
+    except (client_exceptions.ClientError, asyncio.TimeoutError) as exception:
+        raise ConfigEntryNotReady(exception) from exception
 
-    controller_unique_id: str = config[CONF_CONTROLLER_UNIQUE_ID]
+    try:
+        entry_data[CONF_DIRECTOR_SW_VERSION] = await entry_data[
+            CONF_ACCOUNT
+        ].get_controller_os_version(controller_href)
+    except (client_exceptions.ClientError, asyncio.TimeoutError) as exception:
+        raise ConfigEntryNotReady(exception) from exception
 
-    director_token_dict = await call_c4_api_retry(
-        account.getDirectorBearerToken, controller_unique_id
-    )
-
-    director_session = aiohttp_client.async_get_clientsession(hass, verify_ssl=False)
-    director = C4Director(
-        config[CONF_HOST], director_token_dict[CONF_TOKEN], director_session
-    )
-
-    controller_href = (await call_c4_api_retry(account.getAccountControllers))["href"]
-    director_sw_version = await call_c4_api_retry(
-        account.getControllerOSVersion, controller_href
-    )
-
-    _, model, mac_address = controller_unique_id.split("_", 3)
-    director_model = model.upper()
+    _, model, mac_address = entry_data[CONF_CONTROLLER_UNIQUE_ID].split("_", 3)
+    entry_data[CONF_DIRECTOR_MODEL] = model.upper()
 
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, controller_unique_id)},
+        identifiers={(DOMAIN, entry_data[CONF_CONTROLLER_UNIQUE_ID])},
         connections={(dr.CONNECTION_NETWORK_MAC, mac_address)},
         manufacturer="Control4",
-        name=controller_unique_id,
-        model=director_model,
-        sw_version=director_sw_version,
+        name=entry_data[CONF_CONTROLLER_UNIQUE_ID],
+        model=entry_data[CONF_DIRECTOR_MODEL],
+        sw_version=entry_data[CONF_DIRECTOR_SW_VERSION],
     )
 
     # Store all items found on controller for platforms to use
     try:
-        all_items_raw = await director.getAllItemInfo()
-    except (TimeoutError, client_exceptions.ClientError) as err:
-        _LOGGER.error(
-            "Timeout connecting to Control4 controller at %s",
-            config[CONF_HOST],
-        )
-        raise ConfigEntryNotReady(
-            f"Timeout connecting to Control4 controller at {config[CONF_HOST]}"
-        ) from err
+        director_all_items = await entry_data[CONF_DIRECTOR].get_all_item_info()
+    except (client_exceptions.ClientError, asyncio.TimeoutError) as exception:
+        raise ConfigEntryNotReady(exception) from exception
+    entry_data[CONF_DIRECTOR_ALL_ITEMS] = director_all_items
 
-    director_all_items: list[dict[str, Any]] = json.loads(all_items_raw)
-
-    # Check if OS version is 3 or higher to get UI configuration
-    ui_configuration: dict[str, Any] | None = None
-    if int(director_sw_version.split(".")[0]) >= 3:
-        try:
-            ui_config_raw = await director.getUiConfiguration()
-        except (TimeoutError, client_exceptions.ClientError) as err:
-            _LOGGER.error(
-                "Timeout getting UI configuration from Control4 controller at %s",
-                config[CONF_HOST],
-            )
-            raise ConfigEntryNotReady(
-                "Timeout getting UI configuration from"
-                f" Control4 controller at {config[CONF_HOST]}"
-            ) from err
-
-        ui_configuration = json.loads(ui_config_raw)
+    entry_data[CONF_UI_CONFIGURATION] = await entry_data[CONF_DIRECTOR].get_ui_configuration()
 
     # Load options from config entry
-    scan_interval: int = entry.options.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
-
-    entry.runtime_data = Control4RuntimeData(
-        account=account,
-        controller_unique_id=controller_unique_id,
-        director=director,
-        director_all_items=director_all_items,
-        director_model=director_model,
-        director_sw_version=director_sw_version,
-        scan_interval=scan_interval,
-        ui_configuration=ui_configuration,
+    entry_data[CONF_ALARM_AWAY_MODE] = entry.options.get(
+        CONF_ALARM_AWAY_MODE, DEFAULT_ALARM_AWAY_MODE
     )
+    entry_data[CONF_ALARM_HOME_MODE] = entry.options.get(
+        CONF_ALARM_HOME_MODE, DEFAULT_ALARM_HOME_MODE
+    )
+    entry_data[CONF_ALARM_NIGHT_MODE] = entry.options.get(
+        CONF_ALARM_NIGHT_MODE, DEFAULT_ALARM_NIGHT_MODE
+    )
+    entry_data[CONF_ALARM_CUSTOM_BYPASS_MODE] = entry.options.get(
+        CONF_ALARM_CUSTOM_BYPASS_MODE, DEFAULT_ALARM_CUSTOM_BYPASS_MODE
+    )
+    entry_data[CONF_ALARM_VACATION_MODE] = entry.options.get(
+        CONF_ALARM_VACATION_MODE, DEFAULT_ALARM_VACATION_MODE
+    )
+    entry_data[CONF_ENTITY_PREPEND_PARENT_NAME] = entry.options.get(
+        CONF_ENTITY_PREPEND_PARENT_NAME, DEFAULT_ENTITY_PREPEND_PARENT_NAME
+    )
+
+    entry_data[CONF_ALARM_ARM_STATES] = {
+        DEFAULT_ALARM_AWAY_MODE,
+        DEFAULT_ALARM_HOME_MODE,
+        DEFAULT_ALARM_NIGHT_MODE,
+        DEFAULT_ALARM_CUSTOM_BYPASS_MODE,
+        DEFAULT_ALARM_VACATION_MODE,
+    }
+
+    entry_data[CONF_DYNAMIC_DEVICE_CALLBACKS] = []
+
+    # Dynalite gateway listener (TCP) for trigger binary sensors — only when enabled
+    # and Director data includes at least one dynalite_trigger
+    entry_data[CONF_DYNALITE_ENABLED] = entry.options.get(CONF_DYNALITE_ENABLED, False)
+    if entry_data[CONF_DYNALITE_ENABLED]:
+        if director_has_dynalite_triggers(entry_data):
+            await dynalite_module.setup_dynalite_listener(hass, entry, entry_data)
+        else:
+            _LOGGER.info(
+                "Dynalite TCP listener not started: no dynalite_trigger devices in Director data"
+            )
+
+    entry_data[CONF_CONFIG_LISTENER] = entry.add_update_listener(update_listener)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SEND_COMMAND):
+        async def async_send_command_service(call: ServiceCall) -> ServiceResponse:
+            return await _async_handle_send_command(hass, call)
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SEND_COMMAND,
+            async_send_command_service,
+            schema=SERVICE_SEND_COMMAND_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -182,15 +241,477 @@ async def async_setup_entry(hass: HomeAssistant, entry: Control4ConfigEntry) -> 
 
 async def async_unload_entry(hass: HomeAssistant, entry: Control4ConfigEntry) -> bool:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    entry_data = entry.runtime_data
+    if entry_data.get(CONF_DYNALITE_ENABLED):
+        dynalite_module.stop_dynalite_listener(hass, entry.entry_id)
+    _LOGGER.debug("Disconnecting C4Websocket for config entry unload")
+    await entry_data[CONF_WEBSOCKET].sio_disconnect()
+    _LOGGER.debug("Cancelling scheduled token refresh for config entry unload")
+    entry_data[CONF_CANCEL_TOKEN_REFRESH_CALLBACK]()
+
+    if unload_ok:
+        other_loaded = any(
+            e.entry_id != entry.entry_id
+            for e in hass.config_entries.async_entries(DOMAIN)
+        )
+        if not other_loaded and hass.services.has_service(DOMAIN, SERVICE_SEND_COMMAND):
+            hass.services.async_remove(DOMAIN, SERVICE_SEND_COMMAND)
+        _LOGGER.debug("Unloaded entry for %s", entry.entry_id)
+
+    return unload_ok
 
 
-async def get_items_of_category(
-    hass: HomeAssistant, entry: Control4ConfigEntry, category: str
-):
+def _get_director(hass: HomeAssistant, config_entry_id: str | None = None) -> C4Director:
+    """Get a Control4 director, auto-resolving when only one entry is loaded."""
+    if config_entry_id:
+        entry = hass.config_entries.async_get_entry(config_entry_id)
+        if entry is None or not hasattr(entry, "runtime_data"):
+            raise ServiceValidationError("Control4 entry not found or not loaded")
+        director = entry.runtime_data.get(CONF_DIRECTOR)
+    else:
+        entries = hass.config_entries.async_entries(DOMAIN)
+        loaded = [e for e in entries if hasattr(e, "runtime_data")]
+        if not loaded:
+            raise ServiceValidationError("No Control4 entries loaded")
+        if len(loaded) > 1:
+            raise ServiceValidationError("Multiple Control4 entries; use entity_id targeting")
+        director = loaded[0].runtime_data.get(CONF_DIRECTOR)
+    if director is None:
+        raise ServiceValidationError("Control4 director is unavailable")
+    return director
+
+
+def _resolve_entity_target(hass: HomeAssistant, entity_id: str) -> tuple[C4Director, int]:
+    """Resolve entity_id to (director, item_id)."""
+    entity_entry = er.async_get(hass).async_get(entity_id)
+    if entity_entry is None or not entity_entry.config_entry_id:
+        raise ServiceValidationError(f"{entity_id}: not a Control4 entity")
+
+    state = hass.states.get(entity_id)
+    if state is None:
+        raise ServiceValidationError(f"{entity_id}: state unavailable")
+
+    try:
+        item_id = int(state.attributes["item id"])
+    except (KeyError, TypeError, ValueError):
+        raise ServiceValidationError(f"{entity_id}: missing or invalid item id") from None
+
+    return _get_director(hass, entity_entry.config_entry_id), item_id
+
+
+async def _async_handle_send_command(
+    hass: HomeAssistant, call: ServiceCall
+) -> ServiceResponse:
+    command = call.data[SERVICE_FIELD_COMMAND]
+    params = call.data.get(SERVICE_FIELD_PARAMS, {})
+    entity_ids = call.data.get(ATTR_ENTITY_ID, [])
+    item_ids = call.data.get(SERVICE_FIELD_ITEM_ID, [])
+
+    if entity_ids:
+        targets = [_resolve_entity_target(hass, eid) for eid in entity_ids]
+    elif item_ids:
+        director = _get_director(hass)
+        targets = [(director, iid) for iid in item_ids]
+    else:
+        raise ServiceValidationError("One of entity_id or item_id must be provided")
+
+    for director, item_id in targets:
+        await director.send_command(item_id, command, params)
+
+    if call.return_response:
+        return {"sent_count": len(targets)}
+    return None
+
+
+async def _async_check_for_new_devices(
+    hass: HomeAssistant, entry: Control4ConfigEntry
+) -> None:
+    """Re-fetch director items on reconnect and call per-platform callbacks to add new entities."""
+    try:
+        new_items = await entry.runtime_data[CONF_DIRECTOR].get_all_item_info()
+    except Exception:
+        _LOGGER.exception("Failed to re-fetch director items for dynamic device check")
+        return
+    entry.runtime_data[CONF_DIRECTOR_ALL_ITEMS] = new_items
+    for callback in entry.runtime_data.get(CONF_DYNAMIC_DEVICE_CALLBACKS, []):
+        try:
+            await callback(hass, entry)
+        except Exception:
+            _LOGGER.exception("Error in dynamic device callback")
+
+
+async def update_listener(hass, config_entry):
+    """Update when config_entry options update."""
+    _LOGGER.debug("Config entry was updated, rerunning setup")
+    await hass.config_entries.async_reload(config_entry.entry_id)
+
+
+async def get_items_of_category(hass: HomeAssistant, entry: Control4ConfigEntry, category: str):
     """Return a list of all Control4 items with the specified category."""
-    return [
-        item
-        for item in entry.runtime_data.director_all_items
-        if "categories" in item and category in item["categories"]
-    ]
+    _LOGGER.debug("Getting items of category: %s", category)
+    director = entry.runtime_data[CONF_DIRECTOR]
+    try:
+        return_list = await director.get_all_items_by_category(category)
+        return return_list
+    except InvalidCategory:
+        _LOGGER.warning(
+            "Category %s does not exist on this Control4 system, "
+            "entities from this domain will not be setup.",
+            category,
+        )
+        return []
+
+
+async def refresh_tokens(hass: HomeAssistant, entry: Control4ConfigEntry):
+    """Store updated authentication and director tokens in hass.data, and schedule next token refresh."""
+    config = entry.data
+    verify_ssl_session = aiohttp_client.async_get_clientsession(hass)
+
+    account = C4Account(
+        config[CONF_USERNAME], config[CONF_PASSWORD], verify_ssl_session
+    )
+    try:
+        await account.get_account_bearer_token()
+    except (client_exceptions.ClientError, asyncio.TimeoutError) as exception:
+        raise ConfigEntryNotReady(exception) from exception
+    except BadCredentials as exception:
+        raise ConfigEntryAuthFailed(exception) from exception
+
+    controller_unique_id = config[CONF_CONTROLLER_UNIQUE_ID]
+    try:
+        director_token_dict = await account.get_director_bearer_token(controller_unique_id)
+    except (client_exceptions.ClientError, asyncio.TimeoutError) as exception:
+        raise ConfigEntryNotReady(exception) from exception
+    no_verify_ssl_session = aiohttp_client.async_get_clientsession(
+        hass, verify_ssl=False
+    )
+
+    director = C4Director(
+        config[CONF_HOST], director_token_dict[CONF_TOKEN], no_verify_ssl_session
+    )
+
+    _LOGGER.debug("Saving new account and director tokens in entry runtime data")
+    entry_data = entry.runtime_data
+    entry_data[CONF_ACCOUNT] = account
+    entry_data[CONF_DIRECTOR] = director
+
+    if not (
+        CONF_WEBSOCKET in entry_data
+        and isinstance(entry_data[CONF_WEBSOCKET], C4Websocket)
+    ):
+        _LOGGER.debug("First time setup, creating new C4Websocket object")
+        connection_tracker = C4WebsocketConnectionTracker(hass, entry)
+        websocket = C4Websocket(
+            config[CONF_HOST],
+            no_verify_ssl_session,
+            connection_tracker.connect_callback,
+            connection_tracker.disconnect_callback,
+        )
+        entry_data[CONF_WEBSOCKET] = websocket
+
+        # Silence C4Websocket related loggers, that would otherwise spam INFO logs with debugging messages
+        logging.getLogger("socketio.client").setLevel(logging.WARNING)
+        logging.getLogger("engineio.client").setLevel(logging.WARNING)
+        logging.getLogger("charset_normalizer").setLevel(logging.ERROR)
+
+    _LOGGER.debug("Starting new WebSocket connection")
+    try:
+        await entry_data[CONF_WEBSOCKET].sio_connect(director.director_bearer_token)
+    except Exception as exception:
+        raise ConfigEntryNotReady(exception) from exception
+
+    # Schedule refresh 5mins before expiry, but no sooner than 5mins from now
+    delay = max(
+        director_token_dict["validSeconds"] - SCHEDULE_REFRESH_ADVANCE_SEC,
+        SCHEDULE_REFRESH_ADVANCE_SEC,
+    )
+
+    _LOGGER.debug(
+        "Registering next token refresh in %s seconds",
+        delay,
+    )
+    obj = RefreshTokensObject(hass, entry)
+    entry_data[CONF_CANCEL_TOKEN_REFRESH_CALLBACK] = async_call_later(
+        hass=hass,
+        delay=delay,
+        action=obj.refresh_tokens,
+    )
+
+
+class C4WebsocketConnectionTracker:
+    """Object that provides callables to manually refresh entity states if the Control4 Websocket is disconnected/reconnected."""
+
+    def __init__(self, hass: HomeAssistant, entry: Control4ConfigEntry) -> None:
+        """Initialize the state of the connection tracker object."""
+        self.hass = hass
+        self.entry = entry
+
+        self._was_disconnected = False
+
+    async def connect_callback(self) -> None:
+        """Manually refresh entity states when the Websocket is reconnected after a connection drop."""
+        if not self._was_disconnected:
+            return
+
+        _LOGGER.info("Websocket connection to Control4 reestablished")
+
+        # Refresh state of entities so they are not unavailable anymore
+        item_callbacks = self.entry.runtime_data[CONF_WEBSOCKET].item_callbacks
+        for item_id, callback in item_callbacks.items():
+            item_attributes = await director_get_entry_variables(
+                self.hass, self.entry, item_id
+            )
+            message = {
+                "evtName": "OnDataToUI",
+                "iddevice": item_id,
+                "data": item_attributes,
+            }
+            await callback(item_id, message)
+
+        self._was_disconnected = False
+
+        # Check for newly added devices since last connection
+        await _async_check_for_new_devices(self.hass, self.entry)
+
+    async def disconnect_callback(self) -> None:
+        """Detect a Websocket connection loss."""
+        _LOGGER.warning(
+            "Websocket connection to Control4 lost, attempting reconnection"
+        )
+        self._was_disconnected = True
+
+        # Set all entities to unavailable
+        item_callbacks = self.entry.runtime_data[CONF_WEBSOCKET].item_callbacks
+        for item_id, callback in item_callbacks.items():
+            await callback(item_id, False)
+
+
+class RefreshTokensObject:
+    """Object that provides a callable to refresh tokens."""
+
+    def __init__(self, hass: HomeAssistant, entry: Control4ConfigEntry) -> None:
+        """Initialize a RefreshTokensObject by storing the HomeAssistant and ConfigEntry objects required to run refresh_tokens()."""
+        self.hass = hass
+        self.entry = entry
+        self.retries = 0
+
+    async def refresh_tokens(self, datetime):
+        """Call the refresh_tokens function to store updated authentication and director tokens in hass.data."""
+        # unused datetime parameter is required, since Home Assistant will pass a datetime.datetime object as parameter when calling this function via async_call_later()
+        return await self._refresh_token_with_retry()
+
+    async def _refresh_token_with_retry(self):
+        try:
+            await refresh_tokens(self.hass, self.entry)
+        except ConfigEntryNotReady:
+            self._schedule_refresh_retry()
+
+    def _schedule_refresh_retry(self):
+        self.retries += 1
+        # exponential backoff with jitter
+        delay = random.uniform(0, min(2**self.retries, RETRY_BACKOFF_MAX_SEC))
+        _LOGGER.warning("Token refresh failed, trying again in %s seconds", delay)
+        entry_data = self.entry.runtime_data
+        entry_data[CONF_CANCEL_TOKEN_REFRESH_CALLBACK] = async_call_later(
+            hass=self.hass,
+            delay=delay,
+            action=self.refresh_tokens,
+        )
+
+
+class Control4Entity(Entity):
+    """Base entity for Control4."""
+
+    def __init__(
+        self,
+        entry_data: dict,
+        entry: ConfigEntry,
+        name: str,
+        idx: int,
+        device_name: str | None,
+        device_manufacturer: str | None,
+        device_model: str | None,
+        device_id: int,
+        device_area: str | None,
+        device_attributes: dict,
+    ) -> None:
+        """Initialize a Control4 entity."""
+        super().__init__()
+        self.entry = entry
+        self.entry_data = entry_data
+        self._attr_name = name
+        self._attr_unique_id = str(idx)
+        self._idx = idx
+        self._controller_unique_id = entry_data[CONF_CONTROLLER_UNIQUE_ID]
+        self._device_name = device_name
+        self._device_manufacturer = device_manufacturer
+        self._device_model = device_model
+        self._device_id = device_id
+        self._device_area = device_area
+        self._extra_state_attributes = device_attributes
+        self._extra_state_attributes["item id"] = idx
+        self._extra_state_attributes["parent item id"] = device_id
+        # Disable polling
+        self._attr_should_poll = False
+        self._attr_has_entity_name = entry_data.get(
+            CONF_ENTITY_PREPEND_PARENT_NAME, DEFAULT_ENTITY_PREPEND_PARENT_NAME
+        )
+
+    async def async_added_to_hass(self):
+        """Add entity to hass. Register Websockets callbacks to receive entity state updates from Control4."""
+        await super().async_added_to_hass()
+        # Optional short friendly names (entity_prepend_parent_name off): Home Assistant
+        # still prepends the parent device name when the entity has a device_id and the
+        # entity registry has no user "name" override. We set registry name to the short
+        # item name so the UI shows only that string while keeping device_id (areas/rooms).
+        # When prepend is on again, clear registry name only if it still equals the item
+        # name so default device+suffix naming returns without wiping a custom user name.
+        prepend = self.entry_data.get(
+            CONF_ENTITY_PREPEND_PARENT_NAME, DEFAULT_ENTITY_PREPEND_PARENT_NAME
+        )
+        registry = er.async_get(self.hass)
+        reg_entry = registry.async_get(self.entity_id)
+        if reg_entry is not None:
+            if not prepend:
+                if reg_entry.name is None and self._attr_name not in (None, ""):
+                    registry.async_update_entity(self.entity_id, name=self._attr_name)
+            elif reg_entry.name is not None and reg_entry.name == self._attr_name:
+                registry.async_update_entity(self.entity_id, name=None)
+
+        await self.hass.async_add_executor_job(
+            self.entry_data[CONF_WEBSOCKET].add_item_callback,
+            self._idx,
+            self._update_callback,
+        )
+        _LOGGER.debug("Registering item id %s for callback", self._idx)
+        await self.hass.async_add_executor_job(
+            self.entry_data[CONF_WEBSOCKET].add_item_callback,
+            self._device_id,
+            self._update_callback,
+        )
+        _LOGGER.debug(
+            "Registering parent device %s of item id %s for callback",
+            self._device_id,
+            self._idx,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Entity being removed from hass. Unregister Control4 Websockets callbacks for this entity."""
+        try:
+            _LOGGER.debug("Deregistering callback for item id %s", self._idx)
+            # Pass specific callback for selective removal
+            self.entry_data[CONF_WEBSOCKET].remove_item_callback(self._idx, self._update_callback)
+            _LOGGER.debug(
+                "Deregistering callback for parent device %s of item id %s",
+                self._device_id,
+                self._idx,
+            )
+            self.entry_data[CONF_WEBSOCKET].remove_item_callback(self._device_id, self._update_callback)
+        except KeyError:
+            return
+
+    async def _update_callback(self, device, message):
+        """Update state attributes in hass after receiving a Websocket update for our item id/parent device id."""
+        _LOGGER.debug(message)
+
+        # Message will be False when a Websocket disconnect is detected
+        if message is False:
+            if self._attr_available:
+                _LOGGER.warning(
+                    "Control4 entity %s (%s) is unavailable",
+                    self.name,
+                    self._idx,
+                )
+            self._attr_available = False
+        elif message["evtName"] == "OnDataToUI":
+            if not self._attr_available:
+                _LOGGER.info(
+                    "Control4 entity %s (%s) is available again",
+                    self.name,
+                    self._idx,
+                )
+            self._attr_available = True
+            data = message["data"]
+            await self._data_to_extra_state_attributes(data)
+        _LOGGER.debug("Message for device %s", device)
+        self.async_write_ha_state()
+
+    async def _data_to_extra_state_attributes(self, data) -> None:
+        """Load data from Websocket update into extra_state_attributes."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    for k, val in value.items():
+                        self._extra_state_attributes[k] = val
+                else:
+                    self._extra_state_attributes[key.upper()] = value
+
+    @cached_property
+    def device_info(self) -> DeviceInfo:
+        """Return info of parent Control4 device of entity."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, str(self._device_id))},
+            manufacturer=self._device_manufacturer,
+            model=self._device_model,
+            name=self._device_name,
+            via_device=(DOMAIN, self._controller_unique_id),
+            suggested_area=self._device_area,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:  # type: ignore[override]
+        """Return Extra state attributes."""
+        return self._extra_state_attributes
+
+
+class Control4CoordinatorEntity(CoordinatorEntity[Any]):
+    """Base entity for Control4."""
+
+    def __init__(
+        self,
+        entry_data: dict,
+        coordinator: DataUpdateCoordinator[Any],
+        name: str | None,
+        idx: int,
+        device_name: str | None,
+        device_manufacturer: str | None,
+        device_model: str | None,
+        device_id: int,
+        device_area: str,
+        device_attributes: dict,
+    ) -> None:
+        """Initialize a Control4 entity."""
+        super().__init__(coordinator)
+        self.entry_data = entry_data
+        self._attr_name = name
+        self._attr_unique_id = str(idx)
+        self._idx = idx
+        self._controller_unique_id = entry_data[CONF_CONTROLLER_UNIQUE_ID]
+        self._device_name = device_name
+        self._device_manufacturer = device_manufacturer
+        self._device_model = device_model
+        self._device_id = device_id
+        self._device_area = device_area
+        self._extra_state_attributes = device_attributes
+        self._extra_state_attributes["item id"] = idx
+        self._extra_state_attributes["parent item id"] = device_id
+
+    @cached_property
+    def device_info(self) -> DeviceInfo:
+        """Return info of parent Control4 device of entity."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, str(self._device_id))},
+            manufacturer=self._device_manufacturer,
+            model=self._device_model,
+            name=self._device_name,
+            via_device=(DOMAIN, self._controller_unique_id),
+            suggested_area=self._device_area,
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict:  # type: ignore[override]
+        """Return Extra state attributes."""
+        self._extra_state_attributes.update(self.coordinator.data[self._idx])
+        return self._extra_state_attributes
